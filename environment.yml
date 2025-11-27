@@ -14,7 +14,7 @@ dependencies:
   - tqdm
 
   - pip:
-  #  - ./gridencoder
+    - ./gridencoder
     - pillow
     - tensorboard
     - opencv-python
