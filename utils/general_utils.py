@@ -14,6 +14,55 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import cv2
+import numpy as np
+from PIL import Image
+
+def calculate_confidence(depthmap, image, window_size=5):
+    """
+    Combines edge, texture, gradient features to compute depth confidence.
+    """
+
+    # 0. 数据格式转换：确保是 Numpy 数组
+    if isinstance(image, Image.Image):
+        image = np.array(image)  # Convert from PIL to numpy array
+
+    # 转灰度图 (用于边缘和纹理检测)
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # 1. Edge confidence (边缘置信度 - Ce)
+    # 使用 Canny 边缘检测，边缘处（值为255）置信度低，平滑处置信度高
+    edges = cv2.Canny(gray_image, 100, 200)
+    edge_confidence = 1 - edges / 255.0
+
+    # 2. Texture confidence (纹理置信度 - Ct)
+    # 使用拉普拉斯算子，纹理丰富（高频）的地方置信度高
+    laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+    texture_confidence = 1 - np.abs(laplacian) / np.max(np.abs(laplacian))
+
+    # 3. Gradient confidence (梯度置信度 - Cg)
+    # 计算深度图的梯度，深度变化剧烈（梯度大）的地方置信度低
+    grad_x = cv2.Sobel(depthmap, cv2.CV_64F, 1, 0, ksize=5)
+    grad_y = cv2.Sobel(depthmap, cv2.CV_64F, 0, 1, ksize=5)
+    grad_magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    gradient_confidence = 1 / (grad_magnitude + 1e-6)
+
+    # 归一化到 [0, 1]
+    edge_confidence = (edge_confidence - edge_confidence.min()) / (edge_confidence.max() - edge_confidence.min())
+    texture_confidence = (texture_confidence - texture_confidence.min()) / (
+                texture_confidence.max() - texture_confidence.min())
+    gradient_confidence = (gradient_confidence - gradient_confidence.min()) / (
+                gradient_confidence.max() - gradient_confidence.min())
+
+    # 4. 加权融合 (Final Confidence)
+    # 权重: Edge=0.2, Texture=0.5, Gradient=0.3
+    final_confidence_map = 0.2 * edge_confidence + 0.5 * texture_confidence + 0.3 * gradient_confidence
+
+    # 再次归一化
+    final_confidence_map = (final_confidence_map - final_confidence_map.min()) / (
+                final_confidence_map.max() - final_confidence_map.min())
+
+    return final_confidence_map
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))

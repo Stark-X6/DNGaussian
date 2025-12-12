@@ -8,9 +8,11 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import random
 
 import torch
 import torch.nn.functional as F
+from random import randint
 from torch.autograd import Variable
 from math import exp
 
@@ -101,6 +103,59 @@ def patch_norm_l1_loss(input, target, patch_size, margin, return_mask=False):
     input_patches = normalize(patchify(input, patch_size))
     target_patches = normalize(patchify(target, patch_size))
     return margin_l1_loss(input_patches, target_patches, margin, return_mask)
+
+
+# ================= [新增] 支持权重的 Patch Loss =================
+def patch_norm_mse_loss_weighted(pred, target, weight, patch_size, tol=0.0005):
+    """
+    带权重的局部归一化 MSE Loss (修复维度版)
+    """
+    # 使用负索引获取最后两个维度 (Height, Width)
+    # 无论输入是 [C, H, W] 还是 [B, C, H, W] 都能正常工作
+    H, W = pred.shape[-2], pred.shape[-1]
+
+    # 确保 patch_size 不会超过图像尺寸 (虽然一般不会发生)
+    if H < patch_size or W < patch_size:
+        return torch.tensor(0., device=pred.device)
+
+    # 随机采样坐标
+    y = random.randint(0, H - patch_size)
+    x = random.randint(0, W - patch_size)
+
+    # 使用 ... (Ellipsis) 自动匹配前面的维度，只切片最后两维
+    pred_patch = pred[..., y:y + patch_size, x:x + patch_size]
+    target_patch = target[..., y:y + patch_size, x:x + patch_size]
+    weight_patch = weight[..., y:y + patch_size, x:x + patch_size]
+
+    # 归一化 (Local Normalization)
+    def normalize_patch(p):
+        return (p - p.mean()) / (p.std() + 1e-6)
+
+    pred_norm = normalize_patch(pred_patch)
+    target_norm = normalize_patch(target_patch)
+
+    # 计算加权 MSE
+    loss = weight_patch * ((pred_norm - target_norm) ** 2)
+
+    if loss.mean() < tol:
+        return torch.tensor(0., device=pred.device)
+
+    return loss.sum() / (weight_patch.sum() + 1e-6)
+
+def patch_norm_mse_loss_global_weighted(pred, target, weight, tol=0.0005):
+    """
+    带权重的全局归一化 MSE Loss
+    """
+    # 全局归一化
+    pred_norm = (pred - pred.mean()) / (pred.std() + 1e-6)
+    target_norm = (target - target.mean()) / (target.std() + 1e-6)
+
+    loss = weight * ((pred_norm - target_norm) ** 2)
+
+    if loss.mean() < tol:
+        return torch.tensor(0., device=pred.device)
+
+    return loss.sum() / (weight.sum() + 1e-6)
 
 
 def gaussian(window_size, sigma):

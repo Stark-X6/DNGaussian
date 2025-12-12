@@ -11,17 +11,19 @@
 
 import os
 import time
+
+import numpy as np
 import torch
 import torchvision
 from os import makedirs
 from random import randint
 from utils.graphics_utils import fov2focal
-from utils.loss_utils import l1_loss, loss_depth_smoothness, patch_norm_mse_loss, patch_norm_mse_loss_global, ssim
+from utils.loss_utils import l1_loss, loss_depth_smoothness, patch_norm_mse_loss, patch_norm_mse_loss_global, ssim, patch_norm_mse_loss_weighted,  patch_norm_mse_loss_global_weighted
 # from utils.loss_utils import mssim as ssim
 from gaussian_renderer import render, render_for_depth, render_for_opa  # , network_gui
 import sys
 from scene import RenderScene, Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, calculate_confidence
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -36,7 +38,8 @@ except ImportError:
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, near_range):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
+             near_range):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset, opt)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -44,16 +47,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene_sprical = RenderScene(dataset, gaussians, spiral=True)
     gaussians.training_setup(opt)
     if checkpoint:
-        # (model_params, first_iter) = torch.load(checkpoint)
-        # gaussians.restore(model_params, opt)
         (model_params, _) = torch.load(checkpoint)
         gaussians.load_shape(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     viewpoint_sprical_stack = None
@@ -61,52 +62,75 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", ascii=True, dynamic_ncols=True)
     first_iter += 1
 
-    patch_range = (5, 17) # LLFF
+    patch_range = (5, 17)  # LLFF
 
     time_accum = 0
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
         gaussians.update_learning_rate(max(iteration - opt.position_lr_start, 0))
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        # if iteration % 1000 == 0:
-        #     gaussians.oneupSHdegree()
-
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
         if not viewpoint_sprical_stack:
             viewpoint_sprical_stack = scene_sprical.getRenderCameras().copy()
 
-
         gt_image = viewpoint_cam.original_image.cuda()
+
+        # ================= [修改] 开始：计算置信度图 =================
+        # 1. 获取单目深度图
+        depth_mono = 255.0 - viewpoint_cam.depth_mono  # [1, H, W]
+
+        # 2. 准备数据转 numpy (需要移到 CPU)
+        # gt_image: [3, H, W] -> [H, W, 3]
+        img_np = (gt_image.permute(1, 2, 0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        # depth_mono: [1, H, W] -> [H, W]
+        depth_np = depth_mono.detach().cpu().numpy().squeeze()
+
+        # 3. 计算置信度 (调用前面定义的 helper 函数)
+        conf_np = calculate_confidence(depth_np, img_np)
+
+        # 4. 转回 Tensor 并送入 GPU: [1, H, W]
+        confidence_map = torch.from_numpy(conf_np).float().cuda().unsqueeze(0)
+        # ================= [修改] 结束 =================
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        # -------------------------------------------------- DEPTH --------------------------------------------
+        # -------------------------------------------------- DEPTH (Hard) --------------------------------------------
         if iteration > opt.hard_depth_start:
             render_pkg = render_for_depth(viewpoint_cam, gaussians, pipe, background)
             depth = render_pkg["depth"]
 
-            # Depth loss
             loss_hard = 0
-            depth_mono = 255.0 - viewpoint_cam.depth_mono
 
-            loss_l2_dpt = patch_norm_mse_loss(depth[None,...], depth_mono[None,...], randint(patch_range[0], patch_range[1]), opt.error_tolerance)
+            # [修改] 使用带权重的局部 Loss
+            # 注意：patch size 是随机的，这里保持原逻辑
+            loss_l2_dpt = patch_norm_mse_loss_weighted(
+                depth[None, ...],
+                depth_mono[None, ...],
+                confidence_map[None, ...],  # 传入置信度权重
+                randint(patch_range[0], patch_range[1]),
+                opt.error_tolerance
+            )
             loss_hard += 0.1 * loss_l2_dpt
 
-            
             if iteration > 3000:
                 loss_hard += 0.1 * loss_depth_smoothness(depth[None, ...], depth_mono[None, ...])
 
-            loss_global = patch_norm_mse_loss_global(depth[None,...], depth_mono[None,...], randint(patch_range[0], patch_range[1]), opt.error_tolerance)
+            # [修改] 使用带权重的全局 Loss
+            loss_global = patch_norm_mse_loss_global_weighted(
+                depth[None, ...],
+                depth_mono[None, ...],
+                confidence_map[None, ...],  # 传入置信度权重
+                opt.error_tolerance
+            )
             loss_hard += 1 * loss_global
 
             loss_hard.backward()
@@ -114,25 +138,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer.zero_grad(set_to_none=True)
 
-        # -------------------------------------------------- pnt --------------------------------------------
-        if iteration > opt.soft_depth_start :
+        # -------------------------------------------------- pnt (Soft) --------------------------------------------
+        if iteration > opt.soft_depth_start:
             render_pkg = render_for_opa(viewpoint_cam, gaussians, pipe, background)
             viewspace_point_tensor, visibility_filter = render_pkg["viewspace_points"], render_pkg["visibility_filter"]
             depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
-            # Depth loss
             loss_pnt = 0
-            depth_mono = 255.0 - viewpoint_cam.depth_mono
 
-            loss_l2_dpt = patch_norm_mse_loss(depth[None,...], depth_mono[None,...], randint(patch_range[0], patch_range[1]), opt.error_tolerance)
+            # [修改] 使用带权重的局部 Loss
+            loss_l2_dpt = patch_norm_mse_loss_weighted(
+                depth[None, ...],
+                depth_mono[None, ...],
+                confidence_map[None, ...],  # 传入置信度权重
+                randint(patch_range[0], patch_range[1]),
+                opt.error_tolerance
+            )
             loss_pnt += 0.1 * loss_l2_dpt
 
             if iteration > 3000:
                 loss_pnt += 0.1 * loss_depth_smoothness(depth[None, ...], depth_mono[None, ...])
 
-            loss_global = patch_norm_mse_loss_global(depth[None,...], depth_mono[None,...], randint(patch_range[0], patch_range[1]), opt.error_tolerance)
+            # [修改] 使用带权重的全局 Loss
+            loss_global = patch_norm_mse_loss_global_weighted(
+                depth[None, ...],
+                depth_mono[None, ...],
+                confidence_map[None, ...],  # 传入置信度权重
+                opt.error_tolerance
+            )
             loss_pnt += 1 * loss_global
 
             loss_pnt.backward()
@@ -140,38 +175,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-        
+                gaussians.optimizer.zero_grad(set_to_none=True)
 
         # ---------------------------------------------- Photometric --------------------------------------------
-        
+        # ... (以下部分保持不变) ...
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        # depth
-        depth, opacity, alpha = render_pkg["depth"], render_pkg["opacity"], render_pkg['alpha']  # [visibility_filter]
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], \
+        render_pkg["visibility_filter"], render_pkg["radii"]
+        depth, opacity, alpha = render_pkg["depth"], render_pkg["opacity"], render_pkg['alpha']
 
-        # Loss
         Ll1 = l1_loss(image, gt_image)
         loss = Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-
-        # Reg
         loss_reg = torch.tensor(0., device=loss.device)
         shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
-        scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values)**2).mean()
-        opa_pena = 1 - (opacity[opacity > 0.2]**2).mean() + ((1 - opacity[opacity < 0.2])**2).mean()
+        scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values) ** 2).mean()
+        opa_pena = 1 - (opacity[opacity > 0.2] ** 2).mean() + ((1 - opacity[opacity < 0.2]) ** 2).mean()
 
-        loss_reg += opt.shape_pena*shape_pena + opt.scale_pena*scale_pena + opt.opa_pena*opa_pena
+        loss_reg += opt.shape_pena * shape_pena + opt.scale_pena * scale_pena + opt.opa_pena * opa_pena
         loss += loss_reg
 
         loss.backward()
-        
+
         # ================================================================================
 
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
             if not loss.isnan():
                 ema_loss_for_log = 0.4 * (loss.item()) + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -180,52 +210,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             clean_iterations = testing_iterations + [first_iter]
             clean_views(iteration, clean_iterations, scene, gaussians, pipe, background)
             time_accum += iter_start.elapsed_time(iter_end)
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+
+            # [可选修改] 如果你想在 TensorBoard 看到置信度，可以修改 training_report，或者简单点先不改
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+                            testing_iterations, scene, render, (pipe, background))
+
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, render(viewpoint_cam, gaussians, pipe, background)["color"])
 
-            # Densification
             if iteration < opt.densify_until_iter and iteration not in clean_iterations:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
+                                                                     radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:  
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = max_dist = None
-                            
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_threshold, scene.cameras_extent, size_threshold, opt.split_opacity_thresh, max_dist)
-                
-                # if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                #     gaussians.reset_opacity()
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_threshold, scene.cameras_extent,
+                                                size_threshold, opt.split_opacity_thresh, max_dist)
 
             if (iteration - 1) % 25 == 0:
                 viewpoint_sprical_cam = viewpoint_sprical_stack.pop(0)
                 mask_near = None
                 if iteration > 2000:
                     for idx, view in enumerate(scene_sprical.getRenderCameras().copy()):
-                        mask_temp = (gaussians.get_xyz - view.camera_center.repeat(gaussians.get_xyz.shape[0], 1)).norm(dim=1, keepdim=True) < near_range
+                        mask_temp = (gaussians.get_xyz - view.camera_center.repeat(gaussians.get_xyz.shape[0], 1)).norm(
+                            dim=1, keepdim=True) < near_range
                         mask_near = mask_near + mask_temp if mask_near is not None else mask_temp
                     gaussians.prune_points(mask_near.squeeze())
 
-
-                ## render process
-                # if (iteration + 25) > (opt.iterations):
-                #     while viewpoint_sprical_stack:
-                #         render_one_step(iteration, time_accum / 1000, dataset, viewpoint_sprical_cam, gaussians, render, (pipe, background), save=False)
-                #         iteration += 1
-                #         viewpoint_sprical_cam = viewpoint_sprical_stack.pop(0)
-                # render_one_step(iteration, time_accum / 1000, dataset, viewpoint_sprical_cam, gaussians, render, (pipe, background), save=((iteration + 25) > (opt.iterations)))
-
-
-            # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -233,7 +252,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt_latest.pth")
-            
 
 def prepare_output_and_logger(args, opt):    
     if not args.model_path:
