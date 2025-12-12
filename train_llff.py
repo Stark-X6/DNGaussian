@@ -110,8 +110,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             loss_hard = 0
 
-            # [修改] 使用带权重的局部 Loss
-            # 注意：patch size 是随机的，这里保持原逻辑
+            # [Local Loss]: 使用 Hybrid 策略 -> 强加权
+            # 只在置信度高的地方抠细节，边缘处放过，避免毛刺
             loss_l2_dpt = patch_norm_mse_loss_weighted(
                 depth[None, ...],
                 depth_mono[None, ...],
@@ -124,11 +124,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration > 3000:
                 loss_hard += 0.1 * loss_depth_smoothness(depth[None, ...], depth_mono[None, ...])
 
-            # [修改] 使用带权重的全局 Loss
-            loss_global = patch_norm_mse_loss_global_weighted(
+            # [Global Loss]: 使用 Hybrid 策略 -> 回归原版 (不加权)
+            # 作用：死死按住几何大形，防止产生飞出的伪影 (Floaters)
+            loss_global = patch_norm_mse_loss_global(
                 depth[None, ...],
                 depth_mono[None, ...],
-                confidence_map[None, ...],  # 传入置信度权重
+                randint(patch_range[0], patch_range[1]),
                 opt.error_tolerance
             )
             loss_hard += 1 * loss_global
@@ -143,12 +144,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # -------------------------------------------------- pnt (Soft) --------------------------------------------
         if iteration > opt.soft_depth_start:
             render_pkg = render_for_opa(viewpoint_cam, gaussians, pipe, background)
-            viewspace_point_tensor, visibility_filter = render_pkg["viewspace_points"], render_pkg["visibility_filter"]
+            # viewspace_point_tensor, visibility_filter = render_pkg["viewspace_points"], render_pkg["visibility_filter"]
             depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
             loss_pnt = 0
 
-            # [修改] 使用带权重的局部 Loss
+            # [Local Loss]: 使用 Hybrid 策略 -> 强加权
             loss_l2_dpt = patch_norm_mse_loss_weighted(
                 depth[None, ...],
                 depth_mono[None, ...],
@@ -161,11 +162,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration > 3000:
                 loss_pnt += 0.1 * loss_depth_smoothness(depth[None, ...], depth_mono[None, ...])
 
-            # [修改] 使用带权重的全局 Loss
-            loss_global = patch_norm_mse_loss_global_weighted(
+            # [Global Loss]: 使用 Hybrid 策略 -> 回归原版 (不加权)
+            loss_global = patch_norm_mse_loss_global(
                 depth[None, ...],
                 depth_mono[None, ...],
-                confidence_map[None, ...],  # 传入置信度权重
+                randint(patch_range[0], patch_range[1]),
                 opt.error_tolerance
             )
             loss_pnt += 1 * loss_global
